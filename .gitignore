@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.tools/
+.env
+.env.*
+*.log
+__pycache__/
+*.py[cod]
+telegrambot2.0/venv/
+telegrambot2.0/__pycache__/
+telegrambot2.0/taza.log

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ar" dir="rtl" data-page="restaurant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#2E7D32" />
+    <meta
+      name="taza-api-base"
+      content="https://YOUR-RENDER-APP.onrender.com"
+    />
+    <title>تازا - لوحة المطعم</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  </head>
+  <body dir="rtl" data-page="restaurant">
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="logo">لوحة المطعم</div>
+          <div class="subtitle">إدارة الأكياس والطلبات اليوم</div>
+        </div>
+        <button class="pill" id="refreshBtn">تحديث</button>
+      </header>
+
+      <section class="status" id="statusLine">جارٍ التحميل...</section>
+      <section class="status" id="summaryLine"></section>
+
+      <main id="bagsView" class="list"></main>
+      <main id="ordersView" class="list hidden"></main>
+    </div>
+
+    <nav class="bottom-nav">
+      <button class="nav-item active" data-tab="bags">الأكياس</button>
+      <button class="nav-item" data-tab="orders">الطلبات</button>
+    </nav>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <div id="modal" class="modal hidden" aria-hidden="true">
+      <div class="modal-card">
+        <div class="modal-title" id="modalTitle"></div>
+        <input class="modal-input" id="modalInput" type="number" />
+        <div class="actions">
+          <button class="btn ghost" id="modalCancel">إلغاء</button>
+          <button class="btn primary" id="modalConfirm">تأكيد</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
