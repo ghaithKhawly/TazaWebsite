@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: taza-bot
+    runtime: python
+    rootDir: telegrambot2.0
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DEV_MODE
+        value: "false"
+      - key: WEBHOOK_URL
+        value: https://taza-bot.onrender.com
+      - key: WEBAPP_BASE_URL
+        value: https://ghaithkhawly.github.io/TazaWebsite
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_IDS
+        sync: false
+      - key: ADMIN_GROUP_CHAT_ID
+        sync: false
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false
+      - key: SPREADSHEET_NAME
+        sync: false
+
