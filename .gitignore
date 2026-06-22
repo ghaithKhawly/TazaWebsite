@@ -3,6 +3,8 @@ dist/
 .tools/
 .env
 .env.*
+!.env.example
+!telegrambot2.0/.env.example
 *.log
 __pycache__/
 *.py[cod]
