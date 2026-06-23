@@ -108,6 +108,13 @@ class SheetsDB:
         creds_json = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
         if not creds_json:
             raise ValueError("GOOGLE_SHEETS_CREDENTIALS env var not set")
+        creds_json = creds_json.strip()
+        if (
+            len(creds_json) >= 2
+            and creds_json[0] == creds_json[-1]
+            and creds_json[0] in ("'", '"')
+        ):
+            creds_json = creds_json[1:-1]
 
         creds_dict = json.loads(creds_json)
         creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
