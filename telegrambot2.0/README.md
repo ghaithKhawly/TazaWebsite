@@ -112,7 +112,7 @@ git push -u origin main
    | `BOT_TOKEN` | Your bot token |
    | `ADMIN_CHAT_IDS` | Your Telegram ID (comma-sep for multiple) |
    | `ADMIN_GROUP_CHAT_ID` | Your admin group chat ID |
-   | `WEBHOOK_URL` | `https://taza-bot.onrender.com` (your Render URL) |
+   | `WEBHOOK_URL` | `https://taza-bot-ssjy.onrender.com` (your Render URL) |
    | `WEBAPP_BASE_URL` | `https://YOUR_USERNAME.github.io/taza-webapp` |
    | `GOOGLE_SHEETS_CREDENTIALS` | The single-line JSON string |
    | `SPREADSHEET_NAME` | `Taza Bot DB` |
@@ -139,7 +139,7 @@ Render free tier sleeps after 15 minutes of inactivity. UptimeRobot pings it eve
    |---------|-------|
    | Monitor Type | `HTTP(s)` |
    | Friendly Name | `Taza Bot` |
-   | URL | `https://taza-bot.onrender.com/health` |
+   | URL | `https://taza-bot-ssjy.onrender.com/health` |
    | Monitoring Interval | `5 minutes` |
 3. Click **Create Monitor**
 

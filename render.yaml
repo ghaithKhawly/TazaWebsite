@@ -14,7 +14,7 @@ services:
       - key: DEV_MODE
         value: "false"
       - key: WEBHOOK_URL
-        value: https://taza-bot.onrender.com
+        value: https://taza-bot-ssjy.onrender.com
       - key: WEBAPP_BASE_URL
         value: https://ghaithkhawly.github.io/TazaWebsite
       - key: BOT_TOKEN
@@ -27,4 +27,3 @@ services:
         sync: false
       - key: SPREADSHEET_NAME
         sync: false
-
