@@ -11,6 +11,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Optional
@@ -63,7 +65,7 @@ ADMIN_IDS = [
 ADMIN_GROUP_CHAT_ID = os.environ.get("ADMIN_GROUP_CHAT_ID", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
 PORT = int(os.environ.get("PORT", 8443))
-DEV_MODE = os.environ.get("DEV_MODE", "true").lower() == "true"
+DEV_MODE = os.environ.get("DEV_MODE", "false").lower() == "true"
 
 WEBAPP_BASE_URL = os.environ.get(
     "WEBAPP_BASE_URL", "https://<username>.github.io/taza-webapp"
@@ -77,12 +79,16 @@ _default_origin = (
     else "*"
 )
 WEBAPP_CORS_ORIGIN = os.environ.get("WEBAPP_CORS_ORIGIN", _default_origin)
+VENDOR_LEAD_RATE_LIMIT = 5
+VENDOR_LEAD_RATE_WINDOW = 60 * 60
+VENDOR_CLAIM_MAX_AGE = timedelta(days=7)
 
 # Logo: set via /setlogo or replace manually here
 LOGO_FILE_ID = os.environ.get("TAZA_LOGO_FILE_ID", "")
 
 # In-memory dev role overrides
 _dev_role_overrides: dict[int, str] = {}
+_vendor_lead_requests: dict[str, list[float]] = {}
 
 # ──────────────────────────────────────────────────────
 # Static data
@@ -155,6 +161,7 @@ STATUS_AR = {
     BAG_START,
     BAG_END,
     BAG_PHOTO,
+    BAG_CONFIRM,
     ADMIN_REST_NAME,
     ADMIN_REST_AREA,
     ADMIN_REST_ADDR,
@@ -174,7 +181,8 @@ STATUS_AR = {
     VENDOR_SURPLUS,
     VENDOR_INTEREST,
     VENDOR_CONCERN,
-) = range(30)
+    REST_PICKUP_CODE,
+) = range(32)
 
 HTML = ParseMode.HTML
 
@@ -415,16 +423,142 @@ def valid_time(t: str) -> bool:
         return False
 
 
+def normalize_order_code(value: str) -> str:
+    text = (value or "").strip().upper().replace(" ", "")
+    if text.isdigit():
+        return f"TAZA-{int(text):05d}"
+    if re.match(r"^TAZA-\d{5}$", text):
+        return text
+    return text
+
+
+def is_truthy(value) -> bool:
+    return str(value).lower() in ("true", "1", "yes")
+
+
+def order_status_label(status: str) -> str:
+    st_emoji, st_text = STATUS_AR.get(status, ("?", "Unknown"))
+    return f"{st_emoji} {st_text}"
+
+
+def get_restaurant_for_manager(user_id: int) -> Optional[dict]:
+    return db.get_restaurant_by_manager(user_id)
+
+
+def is_manager_for_bag(user_id: int, bag_id: int) -> bool:
+    return db.manager_owns_bag(user_id, bag_id)
+
+
+def is_manager_for_order(user_id: int, order_id: int) -> bool:
+    return db.manager_owns_order(user_id, order_id)
+
+
+def pickup_window_is_valid(start: str, end: str) -> bool:
+    try:
+        start_time = datetime.strptime(start.strip(), "%H:%M")
+        end_time = datetime.strptime(end.strip(), "%H:%M")
+    except ValueError:
+        return False
+    return end_time > start_time
+
+
+def vendor_claim_is_expired(lead: dict, now: Optional[datetime] = None) -> bool:
+    try:
+        created_at = datetime.fromisoformat(str(lead.get("created_at", "")))
+    except (TypeError, ValueError):
+        return True
+    return (now or datetime.now()) - created_at > VENDOR_CLAIM_MAX_AGE
+
+
+def parse_vendor_claim_payload(payload: str) -> Optional[tuple[int, str]]:
+    match = re.fullmatch(r"vendor_claim_(\d+)_([A-Za-z0-9_-]+)", payload or "")
+    if not match:
+        return None
+    return int(match.group(1)), match.group(2)
+
+
+def vendor_lead_review_error(lead: dict) -> str:
+    if lead.get("status") != "new":
+        return "لا يمكن معالجة هذا الطلب قبل ربطه بحساب تيليغرام، أو بعد إغلاقه."
+    if not str(lead.get("user_id", "")).lstrip("-").isdigit():
+        return "لا يوجد حساب تيليغرام مرتبط بهذا الطلب."
+    return ""
+
+
+def normalize_vendor_lead_payload(payload: dict) -> tuple[dict, list[str]]:
+    limits = {
+        "shop_name": 100,
+        "category": 80,
+        "area": 100,
+        "pickup_address": 240,
+        "contact_name": 100,
+        "whatsapp": 30,
+        "closing_time": 5,
+        "surplus_notes": 500,
+    }
+    cleaned = {
+        key: re.sub(r"\s+", " ", str(payload.get(key, "") or "")).strip()
+        for key in limits
+    }
+    errors = []
+    required = (
+        "shop_name",
+        "category",
+        "area",
+        "pickup_address",
+        "contact_name",
+        "whatsapp",
+        "closing_time",
+    )
+    if any(not cleaned[field] for field in required):
+        errors.append("يرجى تعبئة جميع الحقول المطلوبة.")
+    for field, limit in limits.items():
+        if len(cleaned[field]) > limit:
+            errors.append(f"الحقل {field} أطول من الحد المسموح.")
+    if cleaned["category"] not in VENDOR_CATEGORIES:
+        errors.append("نوع النشاط غير صالح.")
+    if cleaned["area"] not in AREAS:
+        errors.append("المنطقة غير صالحة.")
+    cleaned["whatsapp"] = normalize_contact_phone(cleaned["whatsapp"])
+    if not validate_contact_phone(cleaned["whatsapp"]):
+        errors.append("رقم واتساب غير صالح.")
+    if not valid_time(cleaned["closing_time"]):
+        errors.append("وقت الإغلاق يجب أن يكون بصيغة HH:MM.")
+    return cleaned, errors
+
+
+def vendor_lead_client_ip(request: web.Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return (forwarded.split(",", 1)[0].strip() or request.remote or "unknown")[:100]
+
+
+def vendor_lead_rate_allowed(client_ip: str, now: Optional[float] = None) -> bool:
+    timestamp = now if now is not None else time.monotonic()
+    cutoff = timestamp - VENDOR_LEAD_RATE_WINDOW
+    recent = [value for value in _vendor_lead_requests.get(client_ip, []) if value >= cutoff]
+    if len(recent) >= VENDOR_LEAD_RATE_LIMIT:
+        _vendor_lead_requests[client_ip] = recent
+        return False
+    recent.append(timestamp)
+    _vendor_lead_requests[client_ip] = recent
+    return True
+
+
 # ══════════════════════════════════════════════════════
 # NOTIFICATIONS
 # ══════════════════════════════════════════════════════
 
 
-async def notify_admin_group(bot: Bot, message: str):
+async def notify_admin_group(
+    bot: Bot, message: str, reply_markup: Optional[InlineKeyboardMarkup] = None
+):
     if ADMIN_GROUP_CHAT_ID:
         try:
             await bot.send_message(
-                int(ADMIN_GROUP_CHAT_ID), text=message, parse_mode=HTML
+                int(ADMIN_GROUP_CHAT_ID),
+                text=message,
+                parse_mode=HTML,
+                reply_markup=reply_markup,
             )
         except Exception as ex:
             logger.warning("Admin group notify failed: %s", ex)
@@ -566,6 +700,8 @@ async def setlogo_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.args and context.args[0].startswith("vendor_"):
+        return
     uid = update.effective_user.id
     first_name = e(update.effective_user.first_name or "صديقي")
 
@@ -687,6 +823,72 @@ async def vendor_start_command(update: Update, context: ContextTypes.DEFAULT_TYP
     source_arg = context.args[0] if context.args else "vendor"
     context.user_data["vendor_source"] = f"start:{source_arg}"
     return await vendor_command(update, context)
+
+
+async def vendor_claim_start_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    payload = context.args[0] if context.args else ""
+    parsed_claim = parse_vendor_claim_payload(payload)
+    if not parsed_claim:
+        await update.message.reply_text("رابط ربط الطلب غير صالح.")
+        return
+
+    lead_id, claim_token = parsed_claim
+    lead = db.get_vendor_lead_by_id(lead_id)
+    if not lead:
+        await update.message.reply_text("طلب الانضمام غير موجود.")
+        return
+
+    current_user_id = str(lead.get("user_id", "") or "")
+    if current_user_id and not lead.get("claim_token"):
+        if current_user_id == str(update.effective_user.id):
+            await update.message.reply_text(
+                "✅ تم ربط هذا الطلب بحسابك مسبقاً. سيقوم فريق تازا بمراجعته قريباً."
+            )
+        else:
+            await update.message.reply_text("تم ربط هذا الطلب بحساب تيليغرام آخر.")
+        return
+
+    if vendor_claim_is_expired(lead):
+        logger.info("Vendor lead claim expired: %s", lead_id)
+        await update.message.reply_text(
+            "انتهت صلاحية رابط الربط. أرسل طلباً جديداً من موقع تازا."
+        )
+        return
+
+    result, claimed_lead = db.claim_vendor_lead(
+        lead_id,
+        claim_token,
+        update.effective_user.id,
+        update.effective_user.username or "",
+    )
+    if result == "already_claimed":
+        await update.message.reply_text(
+            "✅ تم ربط هذا الطلب بحسابك مسبقاً. سيقوم فريق تازا بمراجعته قريباً."
+        )
+        return
+    if result == "claimed_by_other":
+        await update.message.reply_text("تم ربط هذا الطلب بحساب تيليغرام آخر.")
+        return
+    if result != "claimed" or not claimed_lead:
+        await update.message.reply_text("رابط ربط الطلب غير صالح أو تم استخدامه.")
+        return
+
+    if not db.get_user(update.effective_user.id):
+        db.upsert_user(update.effective_user.id, role="customer")
+    logger.info(
+        "Vendor lead claimed: %s by Telegram user %s",
+        lead_id,
+        update.effective_user.id,
+    )
+    await update.message.reply_text(
+        f"✅ {b('تم ربط طلب متجرك بحساب تيليغرام')}\n{LINE}\n\n"
+        f"المتجر: {b(e(claimed_lead.get('shop_name', '')))}\n"
+        f"سيقوم فريق تازا بمراجعة الطلب، وستصلك رسالة هنا عند تفعيله.",
+        parse_mode=HTML,
+    )
+    await notify_vendor_lead(context.bot, claimed_lead)
 
 
 async def vendor_signup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -892,9 +1094,26 @@ async def vendor_concern_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def notify_vendor_lead(bot: Bot, lead: dict):
     username = f"@{lead['username']}" if lead.get("username") else "—"
+    status = lead.get("status", "new")
+    actions = None
+    if status == "new" and str(lead.get("user_id", "")).lstrip("-").isdigit():
+        actions = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "✅ موافقة",
+                        callback_data=f"lead_approve_{lead['lead_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "❌ رفض",
+                        callback_data=f"lead_reject_{lead['lead_id']}",
+                    ),
+                ]
+            ]
+        )
     message = (
         f"🍽️ {b('طلب انضمام تاجر جديد')}\n{LINE}\n\n"
-        f"#{lead['lead_id']} | user_id: {code(lead['user_id'])} | {e(username)}\n"
+        f"#{lead['lead_id']} | user_id: {code(lead.get('user_id') or 'بانتظار الربط')} | {e(username)}\n"
         f"المتجر: {b(e(lead['shop_name']))}\n"
         f"النوع: {e(lead['category'])}\n"
         f"المنطقة: {e(lead['area'])}\n"
@@ -903,16 +1122,19 @@ async def notify_vendor_lead(bot: Bot, lead: dict):
         f"واتساب: {code(e(lead['whatsapp']))}\n"
         f"وقت الإغلاق: {code(e(lead['closing_time']))}\n"
         f"الفائض: {e(lead.get('surplus_notes') or '—')}\n"
-        f"الاهتمام: {e(lead['interest_level'])}\n"
-        f"القلق الأساسي: {e(lead['main_concern'])}\n"
+        f"الاهتمام: {e(lead.get('interest_level') or '—')}\n"
+        f"القلق الأساسي: {e(lead.get('main_concern') or '—')}\n"
+        f"الحالة: {code(status)}\n"
         f"المصدر: {code(e(lead.get('source', 'telegram_bot')))}"
     )
     if ADMIN_GROUP_CHAT_ID:
-        await notify_admin_group(bot, message)
+        await notify_admin_group(bot, message, reply_markup=actions)
         return
     for aid in ADMIN_IDS:
         try:
-            await bot.send_message(aid, text=message, parse_mode=HTML)
+            await bot.send_message(
+                aid, text=message, parse_mode=HTML, reply_markup=actions
+            )
         except Exception:
             pass
 
@@ -922,31 +1144,127 @@ async def vendorleads_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     leads = db.get_vendor_leads()
     if not leads:
-        await update.message.reply_text(
-            f"📭 {b('لا توجد طلبات انضمام تجار بعد.')}", parse_mode=HTML
-        )
+        await update.message.reply_text("📭 لا توجد طلبات انضمام تجار بعد.")
         return
 
     latest = list(reversed(leads[-10:]))
     new_count = len([lead for lead in leads if lead.get("status") == "new"])
-    lines = []
-    for lead in latest:
-        lines.append(
-            f"{code(lead.get('lead_id', ''))} — {b(e(lead.get('shop_name', '')))}\n"
-            f"{e(lead.get('category', ''))} | {e(lead.get('area', ''))} | {code(e(lead.get('whatsapp', '')))}\n"
-            f"الاهتمام: {e(lead.get('interest_level', ''))} | القلق: {e(lead.get('main_concern', ''))}"
-        )
-
+    pending_count = len(
+        [lead for lead in leads if lead.get("status") == "pending_telegram"]
+    )
     await update.message.reply_text(
         f"🍽️ {b('طلبات انضمام التجار')}\n{LINE}\n\n"
         f"الإجمالي: {b(str(len(leads)))}\n"
-        f"الجديدة: {b(str(new_count))}\n\n"
-        f"{LINE}\n" + "\n\n".join(lines),
+        f"جاهزة للمراجعة: {b(str(new_count))}\n"
+        f"بانتظار ربط تيليغرام: {b(str(pending_count))}",
+        parse_mode=HTML,
+    )
+
+    for lead in latest:
+        status = lead.get("status", "new")
+        rows = []
+        if status == "new":
+            lead_id = lead.get("lead_id", "")
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "✅ موافقة", callback_data=f"lead_approve_{lead_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ رفض", callback_data=f"lead_reject_{lead_id}"
+                    ),
+                ]
+            )
+        await update.message.reply_text(
+            f"{code(lead.get('lead_id', ''))} — {b(e(lead.get('shop_name', '')))}\n"
+            f"{e(lead.get('category', ''))} | {e(lead.get('area', ''))} | {code(e(lead.get('whatsapp', '')))}\n"
+            f"المسؤول: {e(lead.get('contact_name', ''))}\n"
+            f"العنوان: {e(lead.get('pickup_address', ''))}\n"
+            f"الحالة: {code(status)}",
+            parse_mode=HTML,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+
+
+async def vendor_lead_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(update.effective_user.id):
+        await query.message.reply_text("غير مصرح.")
+        return
+
+    _, action, lead_id_raw = query.data.split("_")
+    if not lead_id_raw.isdigit():
+        await query.message.reply_text("طلب غير صالح.")
+        return
+
+    lead_id = int(lead_id_raw)
+    lead = db.get_vendor_lead_by_id(lead_id)
+    if not lead:
+        await query.message.reply_text("طلب الانضمام غير موجود.")
+        return
+
+    status = lead.get("status", "new")
+    if status == action.replace("approve", "approved").replace("reject", "rejected"):
+        await query.message.reply_text("تم تنفيذ هذا الإجراء مسبقاً.")
+        return
+    review_error = vendor_lead_review_error(lead)
+    if review_error:
+        await query.message.reply_text(review_error)
+        return
+
+    if action == "reject":
+        db.update_vendor_lead_status(lead_id, "rejected")
+        logger.info("Vendor lead rejected: %s", lead_id)
+        try:
+            await context.bot.send_message(
+                int(lead["user_id"]),
+                "شكراً لاهتمامك بتازا. تمت مراجعة طلبك، ولن يتم تفعيله في مرحلة التجربة الحالية.",
+            )
+        except Exception:
+            pass
+        await query.message.reply_text(
+            f"تم رفض الطلب {code(lead_id)}.", parse_mode=HTML
+        )
+        return
+
+    if action != "approve":
+        await query.message.reply_text("إجراء غير معروف.")
+        return
+
+    manager_id = int(lead["user_id"])
+    existing = db.get_restaurant_by_manager(manager_id)
+    if existing:
+        rest = existing
+    else:
+        rest = db.add_restaurant(
+            name=lead.get("shop_name", ""),
+            area=lead.get("area", ""),
+            pickup_address=lead.get("pickup_address", ""),
+            manager_chat_id=manager_id,
+        )
+    db.upsert_user(manager_id, role="restaurant")
+
+    db.update_vendor_lead_status(lead_id, "approved")
+    logger.info("Vendor lead approved: %s -> restaurant %s", lead_id, rest.get("restaurant_id"))
+    welcome_caption = (
+        f"✅ {b('أهلاً بك في تازا')}\n{LINE}\n\n"
+        f"تم تفعيل {b(e(rest['name']))} ضمن التجربة.\n\n"
+        f"استخدم /panel للوحة العمل اليومية.\n"
+        f"استخدم /newbag لنشر أكياس اليوم.\n"
+        f"استخدم /mybags لتعديل الأكياس أو إيقافها."
+    )
+    try:
+        await send_logo(context.bot, welcome_caption, chat_id=manager_id)
+    except Exception as ex:
+        logger.warning("Approved restaurant welcome failed: %s", ex)
+
+    await query.message.reply_text(
+        f"تمت الموافقة على الطلب {code(lead_id)} وتفعيل المطعم {code(rest['restaurant_id'])}.",
         parse_mode=HTML,
     )
 
 
-# ══════════════════════════════════════════════════════
 # Location
 # ══════════════════════════════════════════════════════
 
@@ -984,18 +1302,52 @@ async def setlocation_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def panel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_restaurant(uid):
-        await update.message.reply_text("❌ هذه اللوحة متاحة للمطاعم المسجلة فقط.")
+    rest = get_restaurant_for_manager(uid)
+    if not rest:
+        await update.message.reply_text("هذه اللوحة متاحة للمطاعم المفعّلة فقط.")
         return
+    bags = db.get_bags_for_restaurant(rest["restaurant_id"])
+    orders = db.get_orders_for_restaurant_today(rest["restaurant_id"])
+    total_qty = sum(int(bag.get("quantity", 0) or 0) for bag in bags)
+    remaining = sum(int(bag.get("remaining", 0) or 0) for bag in bags)
+    sold = max(total_qty - remaining, 0)
+    reserved = len([order for order in orders if order.get("status") == "reserved"])
+    picked_up = len([order for order in orders if order.get("status") == "picked_up"])
+    cancelled = len([order for order in orders if order.get("status") == "cancelled"])
+    revenue = sum(
+        int((db.get_bag_by_id(order["bag_id"]) or {}).get("discounted_price", 0) or 0)
+        for order in orders
+        if order.get("status") in ("reserved", "picked_up")
+    )
+    rest_name = e(rest["name"])
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("طلبات اليوم", callback_data="rest_orders"),
+                InlineKeyboardButton("أكياس اليوم", callback_data="rest_bags"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "فتح لوحة المطعم",
+                    web_app=WebAppInfo(url=RESTAURANT_WEBAPP_URL),
+                )
+            ],
+        ]
+    )
     await update.message.reply_text(
-        f"🍽️ {b('لوحة المطعم')}\n{LINE}\n\n"
-        f"افتح اللوحة لإدارة الأكياس والطلبات لحظياً.",
+        f"🍽️ {b(f'لوحة {rest_name}')}\n{LINE}\n\n"
+        f"عروض الأكياس اليوم: {b(str(len(bags)))}\n"
+        f"الكمية: {total_qty} | المباع: {sold} | المتبقي: {remaining}\n"
+        f"الطلبات: محجوز {reserved}، مستلم {picked_up}، ملغي {cancelled}\n"
+        f"الإيراد المتوقع: {b(f'{revenue:,} ل.س')}\n\n"
+        f"/newbag لنشر كيس جديد\n"
+        f"/mybags لإدارة الأكياس\n"
+        f"/restorders للتحقق من رموز الاستلام",
         parse_mode=HTML,
-        reply_markup=restaurant_panel_kb(),
+        reply_markup=kb,
     )
 
 
-# ══════════════════════════════════════════════════════
 # Menu / Browse
 # ══════════════════════════════════════════════════════
 
@@ -1446,6 +1798,15 @@ async def orders_command(
 async def customer_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     _, order_id, bag_id = update.callback_query.data.split("_")
+    order = db.get_order_by_id(int(order_id))
+    if not order or str(order.get("user_id")) != str(update.effective_user.id):
+        await update.callback_query.message.reply_text("هذا الطلب لا يتبع لك.")
+        return
+    if order.get("status") == "picked_up":
+        await update.callback_query.message.reply_text(
+            "لا يمكن إلغاء طلب تم استلامه."
+        )
+        return
     success = await db.cancel_reservation(int(order_id), int(bag_id))
     if success:
         await update.callback_query.message.reply_text(
@@ -1456,21 +1817,8 @@ async def customer_cancel_callback(update: Update, context: ContextTypes.DEFAULT
 
 
 # ══════════════════════════════════════════════════════
-# Restaurant callbacks (pickup / cancel)
+# Restaurant callbacks (cancel)
 # ══════════════════════════════════════════════════════
-
-
-async def mark_pickup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    parts = update.callback_query.data.split("_")
-    order_id = int(parts[1])
-    db.update_order_status(order_id, "picked_up")
-    order = db.get_order_by_id(order_id)
-    code_str = order["order_code"] if order else str(order_id)
-    await update.callback_query.message.reply_text(
-        f"✅ {b('تم تسجيل الاستلام')}\n\nالطلب {code(code_str)} تم استلامه بنجاح 🎉",
-        parse_mode=HTML,
-    )
 
 
 async def rest_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1479,6 +1827,9 @@ async def rest_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     order_id = int(parts[1])
     bag_id = int(parts[2])
     customer_id = int(parts[3])
+    if not is_manager_for_order(update.effective_user.id, order_id):
+        await update.callback_query.message.reply_text("هذا الطلب لا يتبع لمطعمك.")
+        return
     success = await db.cancel_reservation(order_id, bag_id)
     if success:
         order = db.get_order_by_id(order_id)
@@ -1643,29 +1994,77 @@ async def bag_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = update.message.text.strip()
     if not valid_time(t):
         await update.message.reply_text(
-            f"❌ صيغة خاطئة. مثال: {code('21:00')}", parse_mode=HTML
+            f"❌ صيغة الوقت غير صحيحة. مثال: {code('21:00')}",
+            parse_mode=HTML,
         )
+        return BAG_END
+    start = context.user_data.get("bag_start", "")
+    if not pickup_window_is_valid(start, t):
+        await update.message.reply_text("يجب أن يكون وقت انتهاء الاستلام بعد وقت بدايته.")
         return BAG_END
     context.user_data["bag_end"] = t
     await update.message.reply_text(
-        f"📸 أرسل صورة للكيس أو المطعم (اختياري):\n" f"أرسل صورة أو اكتب {i('تخطي')}",
+        f"📸 أرسل صورة اختيارية للكيس أو المطعم، أو اكتب {i('تخطي')}.",
         parse_mode=HTML,
     )
     return BAG_PHOTO
 
 
 async def bag_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    photo_file_id = update.message.photo[-1].file_id if update.message.photo else ""
-    return await _finalize_bag(update, context, photo_file_id)
+    context.user_data["photo_file_id"] = update.message.photo[-1].file_id if update.message.photo else ""
+    return await _preview_bag(update, context)
 
 
 async def bag_skip_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    return await _finalize_bag(update, context, "")
+    context.user_data["photo_file_id"] = ""
+    return await _preview_bag(update, context)
+
+
+async def _preview_bag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ud = context.user_data
+    rest = ud["restaurant"]
+    pct = round((1 - ud["bag_disc"] / ud["bag_orig"]) * 100)
+    disc_str = f"{ud['bag_disc']:,} ل.س"
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ نشر", callback_data="bag_confirm_publish"),
+                InlineKeyboardButton("إلغاء", callback_data="bag_confirm_cancel"),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        f"📋 {b('راجع الكيس قبل النشر')}\n{LINE}\n\n"
+        f"المطعم: {b(e(rest['name']))}\n"
+        f"النوع: {e(ud['bag_type'])}\n"
+        f"التلميح: {e(ud.get('bag_hint') or '—')}\n"
+        f"السعر الأصلي: {ud['bag_orig']:,} ل.س\n"
+        f"سعر تازا: {b(disc_str)} (خصم {pct}%)\n"
+        f"الكمية: {b(str(ud['bag_qty']))}\n"
+        f"الاستلام: {ud['bag_start']} – {ud['bag_end']}\n\n"
+        f"هل تريد نشره الآن؟",
+        parse_mode=HTML,
+        reply_markup=kb,
+    )
+    return BAG_CONFIRM
+
+
+async def bag_confirm_publish(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    return await _finalize_bag(update, context, context.user_data.get("photo_file_id", ""))
+
+
+async def bag_confirm_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    context.user_data.clear()
+    await update.callback_query.message.reply_text("تم إلغاء إنشاء الكيس، ولم يتم نشر شيء.")
+    return ConversationHandler.END
 
 
 async def _finalize_bag(update, context, photo_file_id):
     ud = context.user_data
     rest = ud["restaurant"]
+    target = update.message or update.callback_query.message
     is_dev = rest.get("restaurant_id") == 0
 
     if not is_dev:
@@ -1681,21 +2080,19 @@ async def _finalize_bag(update, context, photo_file_id):
             photo_file_id=photo_file_id,
         )
         bag_id_str = f"رقم الكيس: {code(str(bag['bag_id']))}"
+        logger.info("Bag created: %s restaurant=%s qty=%s", bag["bag_id"], rest["restaurant_id"], ud["bag_qty"])
     else:
         bag_id_str = code("[DEV — لم يُحفظ]")
 
-    emoji = BAG_TYPES.get(ud["bag_type"], "📦")
     pct = round((1 - ud["bag_disc"] / ud["bag_orig"]) * 100)
-
     orig_str = f"{ud['bag_orig']:,} ل.س"
     disc_str = f"{ud['bag_disc']:,} ل.س"
-    pct_str = f"{pct}%"
-    await update.message.reply_text(
-        f"✅ {b('تم إنشاء الكيس بنجاح! سيظهر للزبائن الآن.')}\n{LINE}\n\n"
-        f"{emoji} {b(e(ud['bag_type']))} — {e(rest['name'])}\n\n"
+    await target.reply_text(
+        f"✅ {b('تم نشر الكيس بنجاح')}\n{LINE}\n\n"
+        f"{b(e(ud['bag_type']))} — {e(rest['name'])}\n"
         f"التلميح: {e(ud.get('bag_hint') or '—')}\n"
-        f"السعر: {s(orig_str)} ← {b(disc_str)}  {i(pct_str)}\n"
-        f"الكمية: {b(str(ud['bag_qty']))} كيس\n"
+        f"السعر: {s(orig_str)} ← {b(disc_str)} (خصم {pct}%)\n"
+        f"الكمية: {b(str(ud['bag_qty']))}\n"
         f"الاستلام: {ud['bag_start']} – {ud['bag_end']}\n"
         f"{bag_id_str}",
         parse_mode=HTML,
@@ -1704,79 +2101,18 @@ async def _finalize_bag(update, context, photo_file_id):
     return ConversationHandler.END
 
 
-# ══════════════════════════════════════════════════════
 # /mybags  with edit buttons
 # ══════════════════════════════════════════════════════
-
-
-async def mybags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    rest = db.get_restaurant_by_manager(uid)
-    if not rest:
-        await update.message.reply_text("❌ غير مسجّل كمطعم.", parse_mode=HTML)
-        return
-
-    bags = db.get_bags_for_restaurant(rest["restaurant_id"])
-    if not bags:
-        await update.message.reply_text(
-            f"📦 {b('أكياسك اليوم')}\n{LINE}\n\n"
-            f"لا توجد أكياس اليوم. أضف كيساً بـ /newbag",
-            parse_mode=HTML,
-        )
-        return
-
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    await update.message.reply_text(
-        f"📦 {b(f'أكياسك اليوم — {today_str}')}\n" f"إجمالي: {b(str(len(bags)))} كيس",
-        parse_mode=HTML,
-    )
-    for bag in bags:
-        active = str(bag.get("is_active", "")).lower() in ("true", "1")
-        remaining = int(bag.get("remaining", 0))
-        sold = int(bag.get("quantity", 0)) - remaining
-        status = "🟢 نشط" if active and remaining > 0 else "🔴 منتهي"
-        emoji = BAG_TYPES.get(bag["type"], "📦")
-        rest_name = e(rest["name"])
-
-        disc_price = f"{int(bag['discounted_price']):,} ل.س"
-        text = (
-            f"{emoji} {b(e(bag['type']))} — {rest_name}\n"
-            f"💸 {b(disc_price)}  |  🟢 متبقي {b(str(remaining))}\n"
-            f"🕒 {bag['pickup_start']} – {bag['pickup_end']}\n"
-            f"المباع: {sold} / {bag['quantity']}  |  {status}"
-        )
-        bid = bag["bag_id"]
-        rows = []
-        if active:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "🧮 تعديل الكمية", callback_data=f"editbag_qty_{bid}"
-                    ),
-                    InlineKeyboardButton(
-                        "💰 تعديل السعر", callback_data=f"editbag_price_{bid}"
-                    ),
-                ]
-            )
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        "🚫 إيقاف العرض", callback_data=f"deactivate_{bid}"
-                    ),
-                ]
-            )
-
-        await update.message.reply_text(
-            text,
-            parse_mode=HTML,
-            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
-        )
 
 
 async def deactivate_bag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     bag_id = int(update.callback_query.data.replace("deactivate_", ""))
+    if not is_manager_for_bag(update.effective_user.id, bag_id):
+        await update.callback_query.message.reply_text("هذا الكيس لا يتبع لمطعمك.")
+        return
     db.deactivate_bag(bag_id)
+    logger.info("Bag deactivated: %s by manager %s", bag_id, update.effective_user.id)
     await update.callback_query.message.reply_text(
         "🚫 تم إيقاف العرض وإخفاء الكيس من قائمة الزبائن."
     )
@@ -1792,6 +2128,9 @@ async def editbag_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )  # editbag_qty_123 or editbag_price_123
     field = parts[1]  # qty / price
     bag_id = int(parts[2])
+    if not is_manager_for_bag(update.effective_user.id, bag_id):
+        await update.callback_query.message.reply_text("هذا الكيس لا يتبع لمطعمك.")
+        return ConversationHandler.END
     context.user_data["edit_bag_id"] = bag_id
     context.user_data["edit_bag_field"] = field
     prompts = {
@@ -1814,10 +2153,21 @@ async def editbag_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return EDIT_BAG_VALUE
 
     value = int(text)
+    if not is_manager_for_bag(update.effective_user.id, int(bag_id)):
+        await update.message.reply_text("هذا الكيس لا يتبع لمطعمك.")
+        context.user_data.clear()
+        return ConversationHandler.END
     if field == "qty":
-        db.update_bag_field(bag_id, "remaining", value)
+        bag = db.get_bag_by_id(int(bag_id))
+        sold = max(int(bag.get("quantity", 0) or 0) - int(bag.get("remaining", 0) or 0), 0) if bag else 0
+        if value < sold:
+            await update.message.reply_text(
+                f"لا يمكن أن تكون الكمية أقل من العدد المباع ({sold})."
+            )
+            return EDIT_BAG_VALUE
+        db.update_bag_field(bag_id, "remaining", value - sold)
         db.update_bag_field(bag_id, "quantity", value)
-        db.update_bag_field(bag_id, "is_active", True)
+        db.update_bag_field(bag_id, "is_active", value > sold)
         await update.message.reply_text(
             f"✅ تم تحديث الكمية إلى {b(str(value))} كيس.", parse_mode=HTML
         )
@@ -1913,6 +2263,199 @@ async def admin_rest_mgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════
+async def mybags_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    target = update.message or update.callback_query.message
+    rest = get_restaurant_for_manager(uid)
+    if not rest:
+        await target.reply_text("هذا الأمر متاح للمطاعم المفعّلة فقط.")
+        return
+
+    bags = db.get_bags_for_restaurant(rest["restaurant_id"])
+    if not bags:
+        await target.reply_text("لا توجد أكياس اليوم. استخدم /newbag لنشر أول كيس.")
+        return
+
+    rest_name = e(rest["name"])
+    await target.reply_text(
+        f"📦 {b(f'أكياس {rest_name} اليوم')}\n{LINE}\n"
+        f"إجمالي العروض: {b(str(len(bags)))}",
+        parse_mode=HTML,
+    )
+    for bag in bags:
+        remaining = int(bag.get("remaining", 0) or 0)
+        quantity = int(bag.get("quantity", 0) or 0)
+        sold = max(quantity - remaining, 0)
+        active = is_truthy(bag.get("is_active"))
+        if active and remaining > 0:
+            status = "🟢 نشط"
+        elif remaining <= 0:
+            status = "🔴 نفد"
+        else:
+            status = "⚪ متوقف"
+        text = (
+            f"{b(e(bag.get('type', 'كيس')))} #{code(bag.get('bag_id', ''))}\n"
+            f"الحالة: {status}\n"
+            f"السعر: {int(bag.get('discounted_price', 0) or 0):,} ل.س\n"
+            f"الاستلام: {e(bag.get('pickup_start', ''))} – {e(bag.get('pickup_end', ''))}\n"
+            f"المباع: {sold}/{quantity} | المتبقي: {remaining}"
+        )
+        rows = []
+        if active:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "تعديل الكمية",
+                        callback_data=f"editbag_qty_{bag['bag_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "تعديل السعر",
+                        callback_data=f"editbag_price_{bag['bag_id']}",
+                    ),
+                ]
+            )
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "إيقاف العرض",
+                        callback_data=f"deactivate_{bag['bag_id']}",
+                    )
+                ]
+            )
+        await target.reply_text(
+            text,
+            parse_mode=HTML,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+
+
+async def restorders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    target = update.message or update.callback_query.message
+    rest = get_restaurant_for_manager(uid)
+    if not rest:
+        await target.reply_text("هذا الأمر متاح للمطاعم المفعّلة فقط.")
+        return
+    orders = db.get_orders_for_restaurant_today(rest["restaurant_id"])
+    if not orders:
+        await target.reply_text("لا توجد طلبات اليوم بعد.")
+        return
+
+    counts = {}
+    for order in orders:
+        counts[order.get("status", "unknown")] = counts.get(order.get("status", "unknown"), 0) + 1
+    rest_name = e(rest["name"])
+    await target.reply_text(
+        f"🧾 {b(f'طلبات {rest_name} اليوم')}\n{LINE}\n"
+        f"محجوز: {counts.get('reserved', 0)} | مستلم: {counts.get('picked_up', 0)} | "
+        f"ملغي: {counts.get('cancelled', 0)} | لم يحضر: {counts.get('no_show', 0)}",
+        parse_mode=HTML,
+    )
+
+    for order in reversed(orders[-20:]):
+        bag = db.get_bag_by_id(order["bag_id"])
+        rows = []
+        if order.get("status") == "reserved":
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        "تحقق من رمز الاستلام",
+                        callback_data=f"pickup_{order['order_id']}_{order['user_id']}",
+                    ),
+                    InlineKeyboardButton(
+                        "إلغاء",
+                        callback_data=f"restcancel_{order['order_id']}_{order['bag_id']}_{order['user_id']}",
+                    ),
+                ]
+            )
+        text = (
+            f"{code(order.get('order_code', ''))} — {order_status_label(order.get('status', ''))}\n"
+            f"الزبون: {e(order.get('customer_name', ''))} | {e(order.get('customer_phone', ''))}\n"
+            f"الكيس: {e((bag or {}).get('type', ''))}\n"
+            f"الاستلام: {e((bag or {}).get('pickup_start', ''))} – {e((bag or {}).get('pickup_end', ''))}"
+        )
+        await target.reply_text(
+            text,
+            parse_mode=HTML,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+
+
+async def restaurant_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    if update.callback_query.data == "rest_orders":
+        return await restorders_command(update, context)
+    if update.callback_query.data == "rest_bags":
+        return await mybags_command(update, context)
+
+
+async def pickup_code_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split("_")
+    order_id = int(parts[1])
+    uid = update.effective_user.id
+    if not is_manager_for_order(uid, order_id):
+        await query.message.reply_text("هذا الطلب لا يتبع لمطعمك.")
+        return ConversationHandler.END
+    order = db.get_order_by_id(order_id)
+    if not order:
+        await query.message.reply_text("الطلب غير موجود.")
+        return ConversationHandler.END
+    if order.get("status") == "picked_up":
+        await query.message.reply_text(
+            f"تم تسجيل استلام الطلب {code(order.get('order_code', ''))} مسبقاً.",
+            parse_mode=HTML,
+        )
+        return ConversationHandler.END
+    if order.get("status") != "reserved":
+        await query.message.reply_text("يمكن تسجيل الاستلام للطلبات المحجوزة فقط.")
+        return ConversationHandler.END
+    context.user_data["pickup_order_id"] = order_id
+    await query.message.reply_text(
+        f"أدخل رمز الطلب الذي يعرضه الزبون.\n"
+        f"يمكن إدخال الرمز كاملاً مثل {code(order.get('order_code', ''))} أو الرقم فقط.",
+        parse_mode=HTML,
+    )
+    return REST_PICKUP_CODE
+
+
+async def pickup_code_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    order_id = context.user_data.get("pickup_order_id")
+    if not order_id:
+        await update.message.reply_text(
+            "انتهت جلسة التحقق. افتح /restorders وحاول مجدداً."
+        )
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    if not is_manager_for_order(uid, int(order_id)):
+        await update.message.reply_text("هذا الطلب لا يتبع لمطعمك.")
+        return ConversationHandler.END
+    order = db.get_order_by_id(int(order_id))
+    if not order:
+        await update.message.reply_text("الطلب غير موجود.")
+        return ConversationHandler.END
+    submitted = normalize_order_code(update.message.text)
+    expected = normalize_order_code(order.get("order_code", ""))
+    if submitted != expected:
+        await update.message.reply_text("❌ رمز الطلب غير صحيح. لم تتغير حالة الطلب.")
+        return REST_PICKUP_CODE
+    if order.get("status") == "picked_up":
+        await update.message.reply_text("تم تسجيل استلام هذا الطلب مسبقاً.")
+        return ConversationHandler.END
+    if order.get("status") != "reserved":
+        await update.message.reply_text("يمكن تسجيل الاستلام للطلبات المحجوزة فقط.")
+        return ConversationHandler.END
+    db.update_order_status(int(order_id), "picked_up")
+    logger.info("Order picked up: %s by manager %s", order_id, uid)
+    await update.message.reply_text(
+        f"✅ تم تأكيد استلام الطلب {code(expected)}.",
+        parse_mode=HTML,
+    )
+    context.user_data.pop("pickup_order_id", None)
+    return ConversationHandler.END
+
+
 # ADMIN: /allorders
 # ══════════════════════════════════════════════════════
 
@@ -2140,11 +2683,20 @@ async def cors_middleware(request: web.Request, handler):
     response.headers["Access-Control-Allow-Headers"] = "Authorization,Content-Type"
     response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     response.headers["Access-Control-Max-Age"] = "600"
+    response.headers["Vary"] = "Origin"
     return response
 
 
 async def health_handler(request: web.Request):
-    return web.json_response({"status": "ok"})
+    sheets_connected = bool(db.spreadsheet)
+    return web.json_response(
+        {
+            "status": "ok" if sheets_connected else "degraded",
+            "sheets": "connected" if sheets_connected else "not_connected",
+            "webhook": bool(WEBHOOK_URL),
+        },
+        status=200 if sheets_connected else 503,
+    )
 
 
 async def webhook_handler(request: web.Request):
@@ -2157,6 +2709,103 @@ async def webhook_handler(request: web.Request):
     update = Update.de_json(data, app.bot)
     await app.update_queue.put(update)
     return web.json_response({"ok": True})
+
+
+async def api_vendor_lead(request: web.Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response(
+            {"success": False, "message": "بيانات الطلب غير صالحة."},
+            status=400,
+        )
+    if not isinstance(payload, dict):
+        return web.json_response(
+            {"success": False, "message": "بيانات الطلب غير صالحة."},
+            status=400,
+        )
+
+    bot_username = request.app["bot"].username
+    if str(payload.get("company_website", "") or "").strip():
+        logger.info(
+            "Vendor lead blocked by honeypot from ip=%s",
+            vendor_lead_client_ip(request),
+        )
+        return web.json_response(
+            {
+                "success": True,
+                "lead_id": 0,
+                "status": "pending_telegram",
+                "telegram_url": f"https://t.me/{bot_username}",
+            },
+            status=201,
+        )
+
+    client_ip = vendor_lead_client_ip(request)
+    if not vendor_lead_rate_allowed(client_ip):
+        logger.info("Vendor lead rate limited from ip=%s", client_ip)
+        response = web.json_response(
+            {
+                "success": False,
+                "message": "تم إرسال عدة طلبات مؤخراً. حاول مجدداً بعد ساعة.",
+            },
+            status=429,
+        )
+        response.headers["Retry-After"] = str(VENDOR_LEAD_RATE_WINDOW)
+        return response
+
+    cleaned, errors = normalize_vendor_lead_payload(payload)
+    if errors:
+        return web.json_response(
+            {"success": False, "message": errors[0], "errors": errors},
+            status=400,
+        )
+
+    claim_token = secrets.token_urlsafe(18)
+    try:
+        lead = await run_db(
+            db.add_vendor_lead,
+            user_id=0,
+            username="",
+            shop_name=cleaned["shop_name"],
+            category=cleaned["category"],
+            area=cleaned["area"],
+            pickup_address=cleaned["pickup_address"],
+            contact_name=cleaned["contact_name"],
+            whatsapp=cleaned["whatsapp"],
+            closing_time=cleaned["closing_time"],
+            surplus_notes=cleaned["surplus_notes"],
+            interest_level="طلب من الموقع",
+            main_concern="",
+            source="landing_page",
+            status="pending_telegram",
+            claim_token=claim_token,
+        )
+    except Exception:
+        logger.exception("Vendor lead persistence failed")
+        return web.json_response(
+            {
+                "success": False,
+                "message": "تعذر حفظ الطلب حالياً. حاول مجدداً بعد قليل.",
+            },
+            status=503,
+        )
+
+    telegram_url = (
+        f"https://t.me/{bot_username}"
+        f"?start=vendor_claim_{lead['lead_id']}_{claim_token}"
+    )
+    logger.info("Vendor lead accepted from landing page: %s", lead["lead_id"])
+    await notify_vendor_lead(request.app["bot"], lead)
+    return web.json_response(
+        {
+            "success": True,
+            "lead_id": int(lead["lead_id"]),
+            "status": "pending_telegram",
+            "telegram_url": telegram_url,
+        },
+        status=201,
+    )
 
 
 async def api_get_bags(request: web.Request):
@@ -2416,9 +3065,12 @@ async def api_bag_edit(request: web.Request):
         if not str(value).isdigit() or int(value) <= 0:
             return web.json_response({"success": False, "message": "Invalid quantity"}, status=400)
         qty = int(value)
-        await run_db(db.update_bag_field, int(bag_id), "remaining", qty)
+        sold = max(int(bag.get("quantity", 0) or 0) - int(bag.get("remaining", 0) or 0), 0)
+        if qty < sold:
+            return web.json_response({"success": False, "message": "Quantity cannot be less than sold count"}, status=400)
+        await run_db(db.update_bag_field, int(bag_id), "remaining", qty - sold)
         await run_db(db.update_bag_field, int(bag_id), "quantity", qty)
-        await run_db(db.update_bag_field, int(bag_id), "is_active", True)
+        await run_db(db.update_bag_field, int(bag_id), "is_active", qty > sold)
     elif field == "price":
         if not str(value).isdigit() or int(value) <= 0:
             return web.json_response({"success": False, "message": "Invalid price"}, status=400)
@@ -2464,6 +3116,7 @@ async def api_order_pickup(request: web.Request):
 
     user_id = payload.get("user_id", 0)
     order_id = payload.get("order_id", 0)
+    order_code = normalize_order_code(payload.get("order_code", ""))
     if not str(user_id).isdigit() or not str(order_id).isdigit():
         return web.json_response({"success": False, "message": "Invalid payload"}, status=400)
 
@@ -2479,7 +3132,15 @@ async def api_order_pickup(request: web.Request):
     if not order or str(order.get("restaurant_id")) != str(rest["restaurant_id"]):
         return web.json_response({"success": False, "message": "Order not found"}, status=404)
 
+    if order.get("status") == "picked_up":
+        return web.json_response({"success": True, "message": "Already picked up"})
+    if order.get("status") != "reserved":
+        return web.json_response({"success": False, "message": "Only reserved orders can be picked up"}, status=409)
+    if not order_code or order_code != normalize_order_code(order.get("order_code", "")):
+        return web.json_response({"success": False, "message": "Wrong order code"}, status=403)
+
     await run_db(db.update_order_status, int(order_id), "picked_up")
+    logger.info("Order picked up from Mini App: %s by manager %s", order_id, uid)
     try:
         await request.app["bot"].send_message(
             chat_id=int(rest.get("manager_chat_id")),
@@ -2571,6 +3232,7 @@ def build_web_app(application: Application) -> web.Application:
     if WEBHOOK_URL:
         aio_app.router.add_post(_get_webhook_path(WEBHOOK_URL), webhook_handler)
 
+    aio_app.router.add_post("/api/vendor_lead", api_vendor_lead)
     aio_app.router.add_get("/api/bags", api_get_bags)
     aio_app.router.add_get("/api/orders", api_get_orders)
     aio_app.router.add_post("/api/reserve", api_reserve)
@@ -2627,6 +3289,10 @@ def build_app() -> Application:
                 CommandHandler("skip", bag_skip_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bag_skip_photo),
             ],
+            BAG_CONFIRM: [
+                CallbackQueryHandler(bag_confirm_publish, pattern="^bag_confirm_publish$"),
+                CallbackQueryHandler(bag_confirm_cancel, pattern="^bag_confirm_cancel$"),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_conv)],
         allow_reentry=True,
@@ -2674,6 +3340,17 @@ def build_app() -> Application:
         fallbacks=[CommandHandler("cancel", cancel_conv)],
     )
 
+    rest_pickup_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(pickup_code_start, pattern=r"^pickup_\d+_\d+$")],
+        states={
+            REST_PICKUP_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, pickup_code_verify)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conv)],
+        allow_reentry=True,
+    )
+
     setlogo_conv = ConversationHandler(
         entry_points=[CommandHandler("setlogo", setlogo_command)],
         states={
@@ -2688,7 +3365,9 @@ def build_app() -> Application:
             CommandHandler(
                 "start",
                 vendor_start_command,
-                filters.Regex(r"^/start(?:@\w+)?\s+vendor"),
+                filters.Regex(
+                    r"^/start(?:@\w+)?\s+vendor(?!_claim_)(?:_\S+)?$"
+                ),
             ),
             CallbackQueryHandler(vendor_signup_callback, pattern="^vendor_signup$"),
         ],
@@ -2733,7 +3412,15 @@ def build_app() -> Application:
         allow_reentry=True,
     )
 
-    # Deep-link vendor signups should be checked before the generic /start handler.
+    # Claim links and vendor signups are handled before the generic /start command.
+    app.add_handler(
+        CommandHandler(
+            "start",
+            vendor_claim_start_command,
+            filters.Regex(r"^/start(?:@\w+)?\s+vendor_claim_\d+_[A-Za-z0-9_-]+$"),
+        ),
+        group=-2,
+    )
     app.add_handler(vendor_conv, group=-1)
 
     # Commands
@@ -2743,6 +3430,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("orders", orders_command))
     app.add_handler(CommandHandler("mybags", mybags_command))
     app.add_handler(CommandHandler("panel", panel_command))
+    app.add_handler(CommandHandler("restorders", restorders_command))
     app.add_handler(CommandHandler("allorders", allorders_command))
     app.add_handler(CommandHandler("vendorleads", vendorleads_command))
     app.add_handler(CommandHandler("initsheets", initsheets_command))
@@ -2754,18 +3442,18 @@ def build_app() -> Application:
     app.add_handler(addrest_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(editbag_conv)
+    app.add_handler(rest_pickup_conv)
     app.add_handler(setlogo_conv)
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(howto_callback, pattern="^howto$"))
     app.add_handler(CallbackQueryHandler(vendor_info_callback, pattern="^vendor_info$"))
+    app.add_handler(CallbackQueryHandler(vendor_lead_action_callback, pattern=r"^lead_(approve|reject)_\d+$"))
+    app.add_handler(CallbackQueryHandler(restaurant_panel_callback, pattern=r"^rest_(orders|bags)$"))
     app.add_handler(CallbackQueryHandler(browse_callback, pattern="^browse$"))
     app.add_handler(CallbackQueryHandler(my_orders_callback, pattern="^my_orders$"))
     app.add_handler(
         CallbackQueryHandler(setlocation_callback, pattern=r"^(setlocation|area_.+)$")
-    )
-    app.add_handler(
-        CallbackQueryHandler(mark_pickup_callback, pattern=r"^pickup_\d+_\d+$")
     )
     app.add_handler(
         CallbackQueryHandler(rest_cancel_callback, pattern=r"^restcancel_\d+_\d+_\d+$")

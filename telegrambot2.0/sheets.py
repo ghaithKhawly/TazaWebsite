@@ -87,6 +87,8 @@ SHEET_SCHEMAS = {
         "status",
         "source",
         "created_at",
+        "claim_token",
+        "claimed_at",
     ],
 }
 
@@ -95,11 +97,16 @@ LOCK_RETRY_DELAY = 0.3  # seconds
 LOCK_MAX_RETRIES = 8
 
 
+def _truthy(value) -> bool:
+    return str(value).lower() in ("true", "1", "yes")
+
+
 class SheetsDB:
     def __init__(self):
         self.gc: Optional[gspread.Client] = None
         self.spreadsheet: Optional[gspread.Spreadsheet] = None
         self._sheets: dict = {}
+        self._inventory_lock = asyncio.Lock()
 
     def connect(self):
         """Initialize Google Sheets connection from env credentials."""
@@ -167,6 +174,7 @@ class SheetsDB:
                 logger.info("Created sheet: %s", name)
             else:
                 self._sheets[name] = self.spreadsheet.worksheet(name)
+                self._ensure_schema(name)
 
         # Seed config defaults
         self._seed_config()
@@ -338,7 +346,7 @@ class SheetsDB:
         ws = self.sheet("restaurants")
         records = self._get_records("restaurants")
         for r in records:
-            if str(r["manager_chat_id"]) == str(manager_chat_id) and r["is_active"]:
+            if str(r["manager_chat_id"]) == str(manager_chat_id) and _truthy(r["is_active"]):
                 return r
         return None
 
@@ -350,8 +358,22 @@ class SheetsDB:
                 return r
         return None
 
+    def manager_owns_restaurant(self, manager_chat_id: int, restaurant_id: int) -> bool:
+        rest = self.get_restaurant_by_manager(manager_chat_id)
+        return bool(rest and str(rest["restaurant_id"]) == str(restaurant_id))
+
+    def manager_owns_bag(self, manager_chat_id: int, bag_id: int) -> bool:
+        rest = self.get_restaurant_by_manager(manager_chat_id)
+        bag = self.get_bag_by_id(bag_id)
+        return bool(rest and bag and str(bag["restaurant_id"]) == str(rest["restaurant_id"]))
+
+    def manager_owns_order(self, manager_chat_id: int, order_id: int) -> bool:
+        rest = self.get_restaurant_by_manager(manager_chat_id)
+        order = self.get_order_by_id(order_id)
+        return bool(rest and order and str(order["restaurant_id"]) == str(rest["restaurant_id"]))
+
     def get_all_restaurants(self) -> list:
-        return [r for r in self._get_records("restaurants") if r["is_active"]]
+        return [r for r in self._get_records("restaurants") if _truthy(r["is_active"])]
 
     # ─────────────────────────────────────────────
     # VENDOR LEADS
@@ -371,7 +393,11 @@ class SheetsDB:
         interest_level: str,
         main_concern: str,
         source: str = "telegram_bot",
+        status: str = "new",
+        claim_token: str = "",
+        claimed_at: str = "",
     ) -> dict:
+        self._ensure_schema("vendor_leads")
         ws = self.sheet("vendor_leads")
         lead_id = self._next_id("vendor_leads", "lead_id")
         now = datetime.now().isoformat()
@@ -389,9 +415,11 @@ class SheetsDB:
             "surplus_notes": surplus_notes,
             "interest_level": interest_level,
             "main_concern": main_concern,
-            "status": "new",
+            "status": status,
             "source": source,
             "created_at": now,
+            "claim_token": claim_token,
+            "claimed_at": claimed_at,
         }
         headers = ws.row_values(1)
         ws.append_row([lead.get(h, "") for h in headers])
@@ -400,6 +428,63 @@ class SheetsDB:
     def get_vendor_leads(self, limit: int = None) -> list:
         leads = self._get_records("vendor_leads")
         return leads[-limit:] if limit else leads
+
+    def get_vendor_lead_by_id(self, lead_id: int) -> Optional[dict]:
+        records = self._get_records("vendor_leads")
+        for lead in records:
+            if str(lead.get("lead_id")) == str(lead_id):
+                return lead
+        return None
+
+    def update_vendor_lead(self, lead_id: int, **fields) -> Optional[dict]:
+        self._ensure_schema("vendor_leads")
+        ws = self.sheet("vendor_leads")
+        headers = ws.row_values(1)
+        records = self._get_records("vendor_leads")
+        for idx, lead in enumerate(records):
+            if str(lead.get("lead_id")) == str(lead_id):
+                for field, value in fields.items():
+                    if field not in headers:
+                        continue
+                    col = headers.index(field) + 1
+                    ws.update_cell(idx + 2, col, value)
+                    lead[field] = value
+                return lead
+        return None
+
+    def update_vendor_lead_status(self, lead_id: int, status: str) -> bool:
+        return bool(self.update_vendor_lead(lead_id, status=status))
+
+    def claim_vendor_lead(
+        self,
+        lead_id: int,
+        claim_token: str,
+        user_id: int,
+        username: str,
+    ) -> tuple[str, Optional[dict]]:
+        lead = self.get_vendor_lead_by_id(lead_id)
+        if not lead:
+            return "not_found", None
+
+        existing_user_id = str(lead.get("user_id", "") or "")
+        stored_token = str(lead.get("claim_token", "") or "")
+        if existing_user_id and not stored_token:
+            if existing_user_id == str(user_id):
+                return "already_claimed", lead
+            return "claimed_by_other", lead
+
+        if lead.get("status") != "pending_telegram" or stored_token != claim_token:
+            return "invalid", lead
+
+        claimed = self.update_vendor_lead(
+            lead_id,
+            user_id=user_id,
+            username=username,
+            status="new",
+            claim_token="",
+            claimed_at=datetime.now().isoformat(),
+        )
+        return ("claimed", claimed) if claimed else ("not_found", None)
 
     # ─────────────────────────────────────────────
     # BAGS
@@ -563,11 +648,14 @@ class SheetsDB:
         records = self._get_records("orders")
         for idx, o in enumerate(records):
             if str(o["order_id"]) == str(order_id):
+                if str(o.get("status")) == str(status):
+                    return True
                 status_col = headers.index("status") + 1
                 updated_col = headers.index("updated_at") + 1
                 ws.update_cell(idx + 2, status_col, status)
                 ws.update_cell(idx + 2, updated_col, datetime.now().isoformat())
-                return
+                return True
+        return False
 
     def get_order_by_code(self, order_code: str) -> Optional[dict]:
         ws = self.sheet("orders")
@@ -649,11 +737,23 @@ class SheetsDB:
         customer_name: str,
         customer_phone: str,
     ) -> tuple[bool, Optional[dict], str]:
+        async with self._inventory_lock:
+            return await self._atomic_reserve_with_sheet_lock(
+                bag_id, user_id, customer_name, customer_phone
+            )
+
+    async def _atomic_reserve_with_sheet_lock(
+        self,
+        bag_id: int,
+        user_id: int,
+        customer_name: str,
+        customer_phone: str,
+    ) -> tuple[bool, Optional[dict], str]:
         """
         Atomically reserve a bag.
         Returns (success, order_dict, message_ar)
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         for attempt in range(LOCK_MAX_RETRIES):
             # Try to acquire lock in thread pool (blocking IO)
@@ -702,20 +802,35 @@ class SheetsDB:
         return False, None, "النظام مشغول حالياً. حاول مجدداً بعد لحظة."
 
     async def cancel_reservation(self, order_id: int, bag_id: int) -> bool:
+        async with self._inventory_lock:
+            return await self._cancel_reservation_with_sheet_lock(order_id, bag_id)
+
+    async def _cancel_reservation_with_sheet_lock(
+        self, order_id: int, bag_id: int
+    ) -> bool:
         """Cancel an order and restore bag quantity."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         for attempt in range(LOCK_MAX_RETRIES):
             acquired = await loop.run_in_executor(None, self._acquire_lock, bag_id)
             if not acquired:
                 await asyncio.sleep(LOCK_RETRY_DELAY + random.uniform(0, 0.2))
                 continue
             try:
+                order = await loop.run_in_executor(None, self.get_order_by_id, order_id)
+                if not order or str(order.get("bag_id")) != str(bag_id):
+                    return False
+                if order.get("status") == "cancelled":
+                    return True
+                if order.get("status") == "picked_up":
+                    return False
                 await loop.run_in_executor(
                     None, self.update_order_status, order_id, "cancelled"
                 )
                 bag = await loop.run_in_executor(None, self.get_bag_by_id, bag_id)
                 if bag:
-                    new_remaining = int(bag.get("remaining", 0)) + 1
+                    quantity = int(bag.get("quantity", 0) or 0)
+                    remaining = int(bag.get("remaining", 0) or 0)
+                    new_remaining = min(quantity, remaining + 1)
                     await loop.run_in_executor(
                         None, self.update_bag_field, bag_id, "remaining", new_remaining
                     )

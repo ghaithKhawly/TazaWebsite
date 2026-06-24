@@ -235,34 +235,71 @@ python bot.py
 | `orders` | order_id, user_id, bag_id, order_code, status, customer_name, customer_phone |
 | `config` | key, value (next_order_code, admin_group_chat_id) |
 | `locks` | bag_id, locked, locked_at (concurrency control) |
-| `vendor_leads` | lead_id, shop_name, category, area, whatsapp, closing_time, interest_level, main_concern, status |
+| `vendor_leads` | lead_id, Telegram identity, shop/contact details, status, source, claim_token, claimed_at |
 
 ---
 
 ## Vendor Validation Flow
 
-The bot now supports a lightweight founding-vendor signup flow for QR cards, vendor invitation cards, and direct outreach.
+The bot and Arabic landing page share one founding-vendor pipeline.
 
 - `/vendor` starts a guided form for shop owners.
 - Deep links such as `https://t.me/YOUR_BOT?start=vendor_card` also start the same form.
 - The form captures shop name, category, area, pickup address, contact person, WhatsApp, closing time, surplus type, interest level, and main concern.
-- Leads are stored in the `vendor_leads` sheet and forwarded to the admin group.
+- `POST /api/vendor_lead` accepts the equivalent landing-page form and stores it as `pending_telegram`.
+- The website returns a seven-day, single-use Telegram claim link. Opening it attaches the vendor's Telegram identity and moves the lead to `new`.
+- Leads are stored in `vendor_leads` and forwarded to the admin group. Pending website leads have no approval buttons until claimed.
 - Admins can run `/vendorleads` to view the latest leads from inside Telegram.
+- Admins can approve or reject new leads directly from `/vendorleads`.
+- Approval creates an active restaurant account using the lead's Telegram user ID as `manager_chat_id`, marks the lead `approved`, and sends onboarding instructions to the manager.
+- Rejection marks the lead `rejected` and notifies the requester that they are not active in the current pilot.
+- The public endpoint uses a honeypot and a best-effort limit of five submissions per IP per hour.
 
-Run `/initsheets` once after deploying this update so the new `vendor_leads` tab is created.
+Run `/initsheets` once after deploying this update. Existing `vendor_leads` rows are preserved while the new claim columns are appended.
+
+---
+
+## Live Pilot Restaurant Flow
+
+1. Vendor submits interest with `/vendor` or the Arabic landing page.
+2. Website vendors open the returned Telegram link to claim their lead.
+3. Admin reviews `/vendorleads` and approves the claimed lead.
+4. Restaurant manager receives onboarding and uses `/panel` as the daily dashboard.
+5. Manager publishes bags with `/newbag`; the bot shows a preview and requires final confirmation before publishing.
+6. Manager uses `/mybags` to edit quantity/price or deactivate offers. Quantity edits preserve already-sold counts.
+7. Manager uses `/restorders` to view today's orders.
+8. At pickup, the manager enters the customer's `TAZA-xxxxx` code. No direct status-change path bypasses verification.
 
 ---
 
 ## Concurrency Strategy
 
-Reservations use a **locks sheet** as a distributed mutex:
+Reservations and cancellations use two protections:
 
-1. Before reserving, bot tries to write `locked=1` to the bag's lock row
-2. If lock is held and < 10 seconds old → retry (up to 8 times, with jitter)
-3. If lock is stale (> 10s) → it's treated as released (guards against crashed processes)
-4. After reservation, lock is always released in a `finally` block
+1. A process-wide async lock serializes inventory mutations on the single Render instance.
+2. The existing `locks` sheet remains a best-effort cross-process guard with stale-lock recovery and retry jitter.
 
-This prevents overselling without needing a real database. For production scale (> 50 concurrent users), replace Google Sheets with Supabase or Firebase.
+This is appropriate for the single-instance pilot. Google Sheets does not provide transactional row locking, so horizontal scaling or materially higher reservation volume requires a transactional database such as PostgreSQL/Supabase.
+
+---
+
+## Landing Page API
+
+`POST /api/vendor_lead` is public and CORS-restricted to `WEBAPP_CORS_ORIGIN`.
+
+- Required fields: `shop_name`, `category`, `area`, `pickup_address`, `contact_name`, `whatsapp`, `closing_time`
+- Optional fields: `surplus_notes`, honeypot `company_website`
+- Success: `201` with `lead_id`, `status: pending_telegram`, and `telegram_url`
+- Errors: `400` validation, `429` rate limit, `503` Sheets unavailable
+
+The Vite landing page reads:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `VITE_API_BASE_URL` | ✅ | Render API base URL |
+| `VITE_VENDOR_WHATSAPP` | ❌ | Direct WhatsApp link; hidden when empty |
+| `VITE_TELEGRAM_URL` | ❌ | General Telegram contact link; hidden when empty |
+| `VITE_CONTACT_EMAIL` | ❌ | Contact email; hidden when empty |
 
 ---
 

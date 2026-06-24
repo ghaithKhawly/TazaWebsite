@@ -111,6 +111,14 @@
     modal.input.focus();
   };
 
+  const readJson = async (response) => {
+    try {
+      return await response.json();
+    } catch (err) {
+      return { success: false, message: "تعذر قراءة استجابة الخادم." };
+    }
+  };
+
   const closeModal = () => {
     if (!modal.root) return;
     modal.root.classList.add("hidden");
@@ -471,7 +479,7 @@
 
       if (action === "edit-qty") {
         openModal("أدخل الكمية الجديدة", "", async (value) => {
-          await apiFetch("/api/bag/edit", {
+          const res = await apiFetch("/api/bag/edit", {
             method: "POST",
             body: JSON.stringify({
               user_id: userId,
@@ -480,13 +488,18 @@
               value,
             }),
           });
+          const data = await readJson(res);
+          if (!data.success) {
+            showToast(data.message || "تعذر تعديل الكمية.", "error");
+            return;
+          }
           await loadData();
         });
       }
 
       if (action === "edit-price") {
         openModal("أدخل السعر الجديد", "", async (value) => {
-          await apiFetch("/api/bag/edit", {
+          const res = await apiFetch("/api/bag/edit", {
             method: "POST",
             body: JSON.stringify({
               user_id: userId,
@@ -495,6 +508,11 @@
               value,
             }),
           });
+          const data = await readJson(res);
+          if (!data.success) {
+            showToast(data.message || "تعذر تعديل السعر.", "error");
+            return;
+          }
           await loadData();
         });
       }
@@ -503,7 +521,15 @@
         apiFetch("/api/bag/deactivate", {
           method: "POST",
           body: JSON.stringify({ user_id: userId, bag_id: bagId }),
-        }).then(loadData);
+        })
+          .then(readJson)
+          .then(async (data) => {
+            if (!data.success) {
+              showToast(data.message || "تعذر إيقاف الكيس.", "error");
+              return;
+            }
+            await loadData();
+          });
       }
     });
 
@@ -513,17 +539,33 @@
       if (!action || !orderId) return;
 
       if (action === "pickup") {
-        apiFetch("/api/order/pickup", {
-          method: "POST",
-          body: JSON.stringify({ user_id: userId, order_id: orderId }),
-        }).then(loadData);
+        openModal("أدخل رمز الطلب", "", async (orderCode) => {
+          const res = await apiFetch("/api/order/pickup", {
+            method: "POST",
+            body: JSON.stringify({ user_id: userId, order_id: orderId, order_code: orderCode }),
+          });
+          const data = await readJson(res);
+          if (!data.success) {
+            showToast(data.message || "تعذر تأكيد الاستلام.", "error");
+            return;
+          }
+          await loadData();
+        });
       }
 
       if (action === "cancel") {
         apiFetch("/api/order/cancel", {
           method: "POST",
           body: JSON.stringify({ user_id: userId, order_id: orderId }),
-        }).then(loadData);
+        })
+          .then(readJson)
+          .then(async (data) => {
+            if (!data.success) {
+              showToast(data.message || "تعذر إلغاء الطلب.", "error");
+              return;
+            }
+            await loadData();
+          });
       }
     });
 

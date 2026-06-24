@@ -5,6 +5,7 @@ Pickup reminders (30 min before window) + nightly restaurant summaries.
 
 import html
 import logging
+import asyncio
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -31,18 +32,15 @@ def code(text) -> str:
 async def send_pickup_reminders(bot: Bot):
     """Send reminders to customers 30 minutes before their pickup window."""
     try:
-        today_orders = await bot.get_event_loop().run_in_executor(
-            None, db.get_today_orders
-        )
+        loop = asyncio.get_running_loop()
+        today_orders = await loop.run_in_executor(None, db.get_today_orders)
         now = datetime.now()
 
         for order in today_orders:
             if order.get("status") != "reserved":
                 continue
 
-            bag = await bot.get_event_loop().run_in_executor(
-                None, db.get_bag_by_id, order["bag_id"]
-            )
+            bag = await loop.run_in_executor(None, db.get_bag_by_id, order["bag_id"])
             if not bag:
                 continue
 
@@ -59,7 +57,7 @@ async def send_pickup_reminders(bot: Bot):
             delta = pickup_time - now
             # Send reminder if 28–32 minutes away (window to avoid double-send)
             if timedelta(minutes=28) <= delta <= timedelta(minutes=32):
-                rest = await bot.get_event_loop().run_in_executor(
+                rest = await loop.run_in_executor(
                     None, db.get_restaurant_by_id, bag["restaurant_id"]
                 )
                 rest_name = rest["name"] if rest else "المطعم"
@@ -89,9 +87,8 @@ async def send_pickup_reminders(bot: Bot):
 async def send_daily_summaries(bot: Bot):
     """Send nightly summary to each restaurant that had bags today."""
     try:
-        restaurants = await bot.get_event_loop().run_in_executor(
-            None, db.get_all_restaurants
-        )
+        loop = asyncio.get_running_loop()
+        restaurants = await loop.run_in_executor(None, db.get_all_restaurants)
 
         for rest in restaurants:
             rid = rest["restaurant_id"]
@@ -99,13 +96,11 @@ async def send_daily_summaries(bot: Bot):
             if not manager_id:
                 continue
 
-            bags = await bot.get_event_loop().run_in_executor(
-                None, db.get_bags_for_restaurant, rid
-            )
+            bags = await loop.run_in_executor(None, db.get_bags_for_restaurant, rid)
             if not bags:
                 continue
 
-            orders = await bot.get_event_loop().run_in_executor(
+            orders = await loop.run_in_executor(
                 None, db.get_orders_for_restaurant_today, rid
             )
 
@@ -142,18 +137,15 @@ async def send_daily_summaries(bot: Bot):
 async def send_post_pickup_ratings(bot: Bot):
     """After pickup window ends, ask customers to rate their experience."""
     try:
-        today_orders = await bot.get_event_loop().run_in_executor(
-            None, db.get_today_orders
-        )
+        loop = asyncio.get_running_loop()
+        today_orders = await loop.run_in_executor(None, db.get_today_orders)
         now = datetime.now()
 
         for order in today_orders:
             if order.get("status") != "reserved":
                 continue
 
-            bag = await bot.get_event_loop().run_in_executor(
-                None, db.get_bag_by_id, order["bag_id"]
-            )
+            bag = await loop.run_in_executor(None, db.get_bag_by_id, order["bag_id"])
             if not bag:
                 continue
 
