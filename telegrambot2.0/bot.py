@@ -21,7 +21,16 @@ from urllib.parse import parse_qsl, urlparse
 from aiohttp import web
 
 from dotenv import load_dotenv
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
+from telegram import (
+    Bot,
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    WebAppInfo,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -239,13 +248,11 @@ def main_menu_kb(show_rest_panel: bool = False) -> InlineKeyboardMarkup:
     rows.extend(
         [
             [
-                InlineKeyboardButton("📍 منطقتي", callback_data="setlocation"),
-                InlineKeyboardButton("📋 طلباتي", callback_data="my_orders"),
-            ],
-            [
+                InlineKeyboardButton("📍 تحديد المنطقة", callback_data="setlocation"),
                 InlineKeyboardButton("ℹ️ كيف تعمل تازا", callback_data="howto"),
-                InlineKeyboardButton("🍽️ انضم كتاجر", callback_data="vendor_info"),
             ],
+            [InlineKeyboardButton("🍽️ انضم كتاجر", callback_data="vendor_info")],
+            [InlineKeyboardButton("📋 طلباتي", callback_data="my_orders")],
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -399,6 +406,58 @@ def is_admin(uid: int) -> bool:
 
 def is_restaurant(uid: int) -> bool:
     return get_effective_role(uid) == "restaurant"
+
+
+# ══════════════════════════════════════════════════════
+# TELEGRAM COMMAND MENU (per-role)
+# ══════════════════════════════════════════════════════
+
+CUSTOMER_COMMANDS = [
+    BotCommand("start", "بدء استخدام تازا"),
+    BotCommand("menu", "تصفح الأكياس المتاحة"),
+    BotCommand("orders", "طلباتي"),
+    BotCommand("setlocation", "تحديد منطقتي"),
+    BotCommand("vendor", "انضم كتاجر"),
+]
+
+RESTAURANT_COMMANDS = [
+    BotCommand("panel", "لوحة المطعم"),
+    BotCommand("newbag", "إضافة كيس جديد"),
+    BotCommand("mybags", "عرض وإدارة أكياسي"),
+    BotCommand("restorders", "تحقق من طلبات اليوم"),
+    BotCommand("start", "القائمة الرئيسية"),
+]
+
+ADMIN_COMMANDS = [
+    BotCommand("start", "لوحة الإدارة"),
+    BotCommand("addrestaurant", "إضافة مطعم جديد"),
+    BotCommand("allorders", "ملخص طلبات اليوم"),
+    BotCommand("vendorleads", "طلبات انضمام التجار"),
+    BotCommand("broadcast", "رسالة جماعية"),
+    BotCommand("setlogo", "رفع شعار تازا"),
+]
+
+if DEV_MODE:
+    ADMIN_COMMANDS = ADMIN_COMMANDS + [BotCommand("devmode", "تغيير الدور للاختبار")]
+
+
+def commands_for_role(role: str) -> list:
+    if role == "admin":
+        return ADMIN_COMMANDS
+    if role == "restaurant":
+        return RESTAURANT_COMMANDS
+    return CUSTOMER_COMMANDS
+
+
+async def sync_commands_for_user(bot: Bot, user_id: int) -> None:
+    """Set a per-chat command menu matching the user's current role."""
+    role = get_effective_role(user_id)
+    try:
+        await bot.set_my_commands(
+            commands_for_role(role), scope=BotCommandScopeChat(chat_id=user_id)
+        )
+    except Exception as ex:
+        logger.warning("Could not sync command menu for %s: %s", user_id, ex)
 
 
 def validate_syrian_phone(phone: str) -> bool:
@@ -652,6 +711,7 @@ async def devrole_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if role == "reset":
         _dev_role_overrides.pop(uid, None)
         real = get_effective_role(uid)
+        await sync_commands_for_user(context.bot, uid)
         await update.callback_query.message.edit_text(
             f"✅ تم الإعادة للدور الحقيقي: {code(real)}\n\nأرسل /start لتحديث الواجهة.",
             parse_mode=HTML,
@@ -659,6 +719,7 @@ async def devrole_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         _dev_role_overrides[uid] = role
         labels = {"customer": "زبون 👤", "restaurant": "مطعم 🍽️", "admin": "مدير 👑"}
+        await sync_commands_for_user(context.bot, uid)
         await update.callback_query.message.edit_text(
             f"✅ دورك الآن: {b(labels.get(role, role))}\n\nأرسل /start لتجربة الواجهة الجديدة.",
             parse_mode=HTML,
@@ -713,6 +774,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     role = get_effective_role(uid)
     dev_tag = f"  {code('[DEV]')}" if (DEV_MODE and uid in _dev_role_overrides) else ""
+    await sync_commands_for_user(context.bot, uid)
 
     # ── Admin ──
     if role == "admin":
@@ -1246,6 +1308,7 @@ async def vendor_lead_action_callback(update: Update, context: ContextTypes.DEFA
             manager_chat_id=manager_id,
         )
     db.upsert_user(manager_id, role="restaurant")
+    await sync_commands_for_user(context.bot, manager_id)
 
     db.update_vendor_lead_status(lead_id, "approved")
     logger.info("Vendor lead approved: %s -> restaurant %s", lead_id, rest.get("restaurant_id"))
@@ -1395,18 +1458,20 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if not context.user_data.get("webapp_tip_shown"):
+        await msg_target.reply_text(
+            f"✨ {b('تجربة أسرع')}\n"
+            f"افتح تطبيق تازا المصغّر لتصفح الأكياس بسهولة:",
+            parse_mode=HTML,
+            reply_markup=open_app_kb(),
+        )
+        context.user_data["webapp_tip_shown"] = True
+
     bags = db.get_available_bags(area=area)
 
     if not bags:
         kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "🛍️ فتح تطبيق تازا", web_app=WebAppInfo(url=CUSTOMER_WEBAPP_URL)
-                    )
-                ],
-                [InlineKeyboardButton("📍 تغيير المنطقة", callback_data="setlocation")],
-            ]
+            [[InlineKeyboardButton("📍 تغيير المنطقة", callback_data="setlocation")]]
         )
         await msg_target.reply_text(
             f"😔 لا توجد أكياس متاحة حالياً في {b(e(area))}.\n"
@@ -1416,67 +1481,36 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    rows = [
-        [
-            InlineKeyboardButton(
-                "🛍️ فتح تطبيق تازا (تجربة أسرع)", web_app=WebAppInfo(url=CUSTOMER_WEBAPP_URL)
-            )
-        ]
-    ]
-    for bag in bags:
+    await msg_target.reply_text(
+        f"🛍️ {b(f'الأكياس المتاحة في {e(area)}')}\n{LINE}\n\n"
+        f"وجدنا {b(str(len(bags)))} {'كيس' if len(bags) == 1 else 'أكياس'} شهية اليوم! 🎉",
+        parse_mode=HTML,
+    )
+
+    for i_idx, bag in enumerate(bags, 1):
         rest = db.get_restaurant_by_id(bag["restaurant_id"])
         if not rest:
             continue
-        emoji = BAG_TYPES.get(bag["type"], "📦")
-        disc = int(bag["discounted_price"])
-        remaining = int(bag.get("remaining", 0))
-        label = f"{emoji} {rest['name']} — {disc:,} ل.س ({remaining} متبقي)"
-        rows.append(
-            [InlineKeyboardButton(label, callback_data=f"bagdetail_{bag['bag_id']}")]
+        text = _bag_card_html(bag, rest, index=i_idx)
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "احجز 🛒", callback_data=f"reserve_{bag['bag_id']}"
+                    )
+                ]
+            ]
         )
-    rows.append([InlineKeyboardButton("📍 تغيير المنطقة", callback_data="setlocation")])
-
-    await msg_target.reply_text(
-        f"🛍️ {b(f'الأكياس المتاحة في {e(area)}')}\n{LINE}\n\n"
-        f"وجدنا {b(str(len(bags)))} {'كيس' if len(bags) == 1 else 'أكياس'} شهية اليوم! 🎉\n"
-        f"{i('اضغط على أي عرض لرؤية التفاصيل والحجز 👇')}",
-        parse_mode=HTML,
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
-
-
-async def bag_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    bag_id = int(query.data.replace("bagdetail_", ""))
-    bag = db.get_bag_by_id(bag_id)
-    if not bag or int(bag.get("remaining", 0) or 0) <= 0 or not is_truthy(bag.get("is_active")):
-        await query.message.reply_text(
-            "😔 نفذ هذا العرض. جرّب عرضاً آخر بكتابة /menu"
-        )
-        return
-
-    rest = db.get_restaurant_by_id(bag["restaurant_id"])
-    if not rest:
-        return
-
-    text = _bag_card_html(bag, rest)
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("احجز 🛒", callback_data=f"reserve_{bag['bag_id']}")],
-            [InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="browse")],
-        ]
-    )
-    photo = bag.get("photo_file_id", "")
-    if photo:
-        try:
-            await query.message.reply_photo(
-                photo=photo, caption=text, parse_mode=HTML, reply_markup=kb
-            )
-            return
-        except BadRequest as ex:
-            logger.warning("Bag photo failed: %s", ex)
-    await query.message.reply_text(text, parse_mode=HTML, reply_markup=kb)
+        photo = bag.get("photo_file_id", "")
+        if photo:
+            try:
+                await msg_target.reply_photo(
+                    photo=photo, caption=text, parse_mode=HTML, reply_markup=kb
+                )
+                continue
+            except BadRequest as ex:
+                logger.warning("Bag photo failed: %s", ex)
+        await msg_target.reply_text(text, parse_mode=HTML, reply_markup=kb)
 
 
 async def browse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2286,6 +2320,7 @@ async def admin_rest_mgrid(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⬣ /mybags — عرض أكياسك اليوم"
         )
         await send_logo(context.bot, welcome_caption, chat_id=manager_id)
+        await sync_commands_for_user(context.bot, manager_id)
     except Exception as ex:
         logger.warning("Welcome message to restaurant failed: %s", ex)
 
@@ -3482,9 +3517,6 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(vendor_lead_action_callback, pattern=r"^lead_(approve|reject)_\d+$"))
     app.add_handler(CallbackQueryHandler(restaurant_panel_callback, pattern=r"^rest_(orders|bags)$"))
     app.add_handler(CallbackQueryHandler(browse_callback, pattern="^browse$"))
-    app.add_handler(
-        CallbackQueryHandler(bag_detail_callback, pattern=r"^bagdetail_\d+$")
-    )
     app.add_handler(CallbackQueryHandler(my_orders_callback, pattern="^my_orders$"))
     app.add_handler(
         CallbackQueryHandler(setlocation_callback, pattern=r"^(setlocation|area_.+)$")
@@ -3530,6 +3562,14 @@ if __name__ == "__main__":
         ptb_app = build_app()
         await ptb_app.initialize()
         await ptb_app.start()
+
+        try:
+            await ptb_app.bot.set_my_commands(
+                CUSTOMER_COMMANDS, scope=BotCommandScopeDefault()
+            )
+            logger.info("Default command menu set.")
+        except Exception as ex:
+            logger.warning("Could not set default command menu: %s", ex)
 
         scheduler = setup_scheduler(ptb_app.bot)
 
