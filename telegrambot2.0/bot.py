@@ -239,11 +239,13 @@ def main_menu_kb(show_rest_panel: bool = False) -> InlineKeyboardMarkup:
     rows.extend(
         [
             [
-                InlineKeyboardButton("📍 تحديد المنطقة", callback_data="setlocation"),
-                InlineKeyboardButton("ℹ️ كيف تعمل تازا", callback_data="howto"),
+                InlineKeyboardButton("📍 منطقتي", callback_data="setlocation"),
+                InlineKeyboardButton("📋 طلباتي", callback_data="my_orders"),
             ],
-            [InlineKeyboardButton("🍽️ انضم كتاجر", callback_data="vendor_info")],
-            [InlineKeyboardButton("📋 طلباتي", callback_data="my_orders")],
+            [
+                InlineKeyboardButton("ℹ️ كيف تعمل تازا", callback_data="howto"),
+                InlineKeyboardButton("🍽️ انضم كتاجر", callback_data="vendor_info"),
+            ],
         ]
     )
     return InlineKeyboardMarkup(rows)
@@ -1393,20 +1395,18 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if not context.user_data.get("webapp_tip_shown"):
-        await msg_target.reply_text(
-            f"✨ {b('تجربة أسرع')}\n"
-            f"افتح تطبيق تازا المصغّر لتصفح الأكياس بسهولة:",
-            parse_mode=HTML,
-            reply_markup=open_app_kb(),
-        )
-        context.user_data["webapp_tip_shown"] = True
-
     bags = db.get_available_bags(area=area)
 
     if not bags:
         kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📍 تغيير المنطقة", callback_data="setlocation")]]
+            [
+                [
+                    InlineKeyboardButton(
+                        "🛍️ فتح تطبيق تازا", web_app=WebAppInfo(url=CUSTOMER_WEBAPP_URL)
+                    )
+                ],
+                [InlineKeyboardButton("📍 تغيير المنطقة", callback_data="setlocation")],
+            ]
         )
         await msg_target.reply_text(
             f"😔 لا توجد أكياس متاحة حالياً في {b(e(area))}.\n"
@@ -1416,36 +1416,67 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await msg_target.reply_text(
-        f"🛍️ {b(f'الأكياس المتاحة في {e(area)}')}\n{LINE}\n\n"
-        f"وجدنا {b(str(len(bags)))} {'كيس' if len(bags) == 1 else 'أكياس'} شهية اليوم! 🎉",
-        parse_mode=HTML,
-    )
-
-    for i_idx, bag in enumerate(bags, 1):
+    rows = [
+        [
+            InlineKeyboardButton(
+                "🛍️ فتح تطبيق تازا (تجربة أسرع)", web_app=WebAppInfo(url=CUSTOMER_WEBAPP_URL)
+            )
+        ]
+    ]
+    for bag in bags:
         rest = db.get_restaurant_by_id(bag["restaurant_id"])
         if not rest:
             continue
-        text = _bag_card_html(bag, rest, index=i_idx)
-        kb = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "احجز 🛒", callback_data=f"reserve_{bag['bag_id']}"
-                    )
-                ]
-            ]
+        emoji = BAG_TYPES.get(bag["type"], "📦")
+        disc = int(bag["discounted_price"])
+        remaining = int(bag.get("remaining", 0))
+        label = f"{emoji} {rest['name']} — {disc:,} ل.س ({remaining} متبقي)"
+        rows.append(
+            [InlineKeyboardButton(label, callback_data=f"bagdetail_{bag['bag_id']}")]
         )
-        photo = bag.get("photo_file_id", "")
-        if photo:
-            try:
-                await msg_target.reply_photo(
-                    photo=photo, caption=text, parse_mode=HTML, reply_markup=kb
-                )
-                continue
-            except BadRequest as ex:
-                logger.warning("Bag photo failed: %s", ex)
-        await msg_target.reply_text(text, parse_mode=HTML, reply_markup=kb)
+    rows.append([InlineKeyboardButton("📍 تغيير المنطقة", callback_data="setlocation")])
+
+    await msg_target.reply_text(
+        f"🛍️ {b(f'الأكياس المتاحة في {e(area)}')}\n{LINE}\n\n"
+        f"وجدنا {b(str(len(bags)))} {'كيس' if len(bags) == 1 else 'أكياس'} شهية اليوم! 🎉\n"
+        f"{i('اضغط على أي عرض لرؤية التفاصيل والحجز 👇')}",
+        parse_mode=HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def bag_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    bag_id = int(query.data.replace("bagdetail_", ""))
+    bag = db.get_bag_by_id(bag_id)
+    if not bag or int(bag.get("remaining", 0) or 0) <= 0 or not is_truthy(bag.get("is_active")):
+        await query.message.reply_text(
+            "😔 نفذ هذا العرض. جرّب عرضاً آخر بكتابة /menu"
+        )
+        return
+
+    rest = db.get_restaurant_by_id(bag["restaurant_id"])
+    if not rest:
+        return
+
+    text = _bag_card_html(bag, rest)
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("احجز 🛒", callback_data=f"reserve_{bag['bag_id']}")],
+            [InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="browse")],
+        ]
+    )
+    photo = bag.get("photo_file_id", "")
+    if photo:
+        try:
+            await query.message.reply_photo(
+                photo=photo, caption=text, parse_mode=HTML, reply_markup=kb
+            )
+            return
+        except BadRequest as ex:
+            logger.warning("Bag photo failed: %s", ex)
+    await query.message.reply_text(text, parse_mode=HTML, reply_markup=kb)
 
 
 async def browse_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3451,6 +3482,9 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(vendor_lead_action_callback, pattern=r"^lead_(approve|reject)_\d+$"))
     app.add_handler(CallbackQueryHandler(restaurant_panel_callback, pattern=r"^rest_(orders|bags)$"))
     app.add_handler(CallbackQueryHandler(browse_callback, pattern="^browse$"))
+    app.add_handler(
+        CallbackQueryHandler(bag_detail_callback, pattern=r"^bagdetail_\d+$")
+    )
     app.add_handler(CallbackQueryHandler(my_orders_callback, pattern="^my_orders$"))
     app.add_handler(
         CallbackQueryHandler(setlocation_callback, pattern=r"^(setlocation|area_.+)$")
