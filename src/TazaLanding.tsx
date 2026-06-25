@@ -426,7 +426,7 @@ function Calculator() {
   const [price, setPrice] = useState(25000);
   const [days, setDays] = useState(26);
   const total = baskets * price * days;
-  const formatted = `${new Intl.NumberFormat("ar-SY").format(total || 0)} ل.س`;
+  const formatted = `${new Intl.NumberFormat("en-US").format(total || 0)} ل.س`;
 
   return (
     <section className="calculator" id="calculator">
